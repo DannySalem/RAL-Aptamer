@@ -2,26 +2,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# TODO Replace with Desired Network Architecture
+# TODO Replace with Desired Network Architecture. Currently
 class QueryNetworkDQN(nn.Module):
     def __init__(
         self, model_state_length, action_state_length, bias_average,
     ):
-        """Initialises the Query Network. A Network that computes Q-values starting from classification state and action state.
+        """Initialises the Query Network. A Network that computes Q-values starting from model state and action state.
 
-        :param: classifier_state_length: An integer indicating the number of features in classifier state.
+        :param: model_state_length: An integer indicating the number of features in model state.
         :param: action_state_length: An integer indicating the number of features in action state.
         :param: bias_average: A float that is used to initialize the bias in the last layer.
         """
         self.model_state_length = model_state_length
         self.action_state_length = action_state_length
 
-        # A fully connected layers with classifier_placeholder as input
+        # A fully connected layers with model_state as input
         self.fc1 = nn.Sigmoid(
             nn.Linear(self.model_state_length, 10)
         )  # not trainable if not is_target_dqn
 
-        # Concatenate the output of first fully connected layer with action_placeholder
+        # Concatenate the output of first fully connected layer with action_state
 
         # A fully connected layer with fc2concat as input
         self.fc3 = nn.Sigmoid(
