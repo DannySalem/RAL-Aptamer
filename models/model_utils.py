@@ -189,45 +189,7 @@ def load_models(
     return logger, curr_epoch, best_record
 
 
-def get_region_candidates(candidates, train_set, num_regions=2):
-    """Get region candidates function.
-    :param candidates: (list) randomly sampled image indexes for images that contain unlabeled regions.
-    :param train_set: Training set.
-    :param num_regions: Number of regions to take as possible regions to be labeled.
-    :return: candidate_regions: List of tuples (int(Image index), int(width_coord), int(height_coord)).
-        The coordinate is the left upper corner of the region.
-    """
-    s = time.time()
-    print("Getting region candidates...")
-    total_regions = num_regions
-    candidate_regions = []
-    #### --- Get candidate regions --- ####
-    counter_regions = 0
-    available_regions = train_set.get_num_unlabeled_regions()
-    rx, ry = train_set.get_unlabeled_regions()
-    while (
-        counter_regions < total_regions and (total_regions - counter_regions) <= available_regions
-    ):
-        index_ = np.random.choice(len(candidates))
-        index = candidates[index_]
-        num_regions_left = train_set.get_num_unlabeled_regions_image(int(index))
-        if num_regions_left > 0:
-            counter_x, counter_y = train_set.get_random_unlabeled_region_image(int(index))
-            candidate_regions.append((int(index), counter_x, counter_y))
-            available_regions -= 1
-            counter_regions += 1
-            if num_regions_left == 1:
-                candidates.pop(int(index_))
-        else:
-            print("This image has no more unlabeled regions!")
-
-    train_set.set_unlabeled_regions(rx, ry)
-    print("Regions candidates indexed! Time elapsed: " + str(time.time() - s))
-    print("Candidate regions are " + str(counter_regions))
-    return candidate_regions
-
-
-def compute_state(net, state_dataset, unlabelled_dataset, labelled_dataset):
+def compute_state(net, stateLoader, unlabelledLoader, labelled_dataset, unlabelled_dataset):
     ## Adapted from LAL-RL, https://github.com/ksenia-konyushkova/LAL-RL
     """Function for computing the state depending on the sequence model and next available actions.
 
@@ -247,22 +209,44 @@ def compute_state(net, state_dataset, unlabelled_dataset, labelled_dataset):
     """
     # COMPUTE MODEL_STATE
     net.eval()
-    predictions = [net(datapoint) for datapoint in state_dataset]
-    idx = np.argsort(predictions)
+    # TODO Fix Jankiness here.
+    predictions = [net(torch.tensor(datapoint).to("cuda:0")) for datapoint in stateLoader]
+    predictions = torch.cat([*predictions])[:, 0]
+    idx = torch.argsort(predictions)
     # the state representation is the *sorted* list of scores
     model_state = predictions[idx]
 
     # COMPUTE ACTION_STATE
     # prediction (score) of model on each unlabelled sample
-    a1 = [net(datapoint) for datapoint in unlabelled_dataset]
+    a1 = [net(datapoint) for datapoint in unlabelledLoader]
+    a1 = torch.cat([*a1])[:, 0]
     a2 = []
     a3 = []
-    for xi, idx in enumerate(unlabelled_dataset):
+    for idx, xi in enumerate(unlabelled_dataset):
         # average distance to every unlabelled datapoint
-        a2 += np.mean([np.sum(xi != datapoint) for datapoint in unlabelled_dataset])
+        a2 += [
+            torch.mean(
+                torch.tensor(
+                    [torch.sum(xi != datapoint) for datapoint in unlabelled_dataset],
+                    dtype=torch.float32,
+                    device=torch.device("cuda:0"),
+                )
+            )
+        ]
         # average distance to every labelled datapoint
-        a3 += np.mean([np.sum(xi != datapoint) for datapoint in labelled_dataset])
-    action_state = np.concatenate(([a1], [a2], [a3]), axis=0)
+        a3 += [
+            torch.mean(
+                torch.tensor(
+                    [torch.sum(xi != datapoint[0]) for datapoint in labelled_dataset],
+                    dtype=torch.float32,
+                    device=torch.device("cuda:0"),
+                )
+            )
+        ]
+    a2 = torch.stack(a2)
+    a3 = torch.stack(a3)
+    action_state = torch.stack([a1, a2, a3])
+    action_state = torch.transpose(action_state, 0, 1)
     return model_state, action_state
 
 
@@ -281,62 +265,25 @@ def select_action(args, policy_net, model_state, action_state, steps_done, test=
     sample = random.random()
     eps_threshold = EPS_END + (EPS_START - EPS_END) * math.exp(-1.0 * steps_done / EPS_DECAY)
     q_val_ = []
+    sample = 1  # TODO Remove
     if sample > eps_threshold or test:
         print("Action selected with DQN!")
         with torch.no_grad():
             # Get Q-values for every action
             q_val_ = [policy_net(model_state, action_i_state) for action_i_state in action_state]
 
-            action = q_val_.max(index)[1].view(-1).cpu()
+            action = torch.argmax(torch.stack(q_val_))
             del q_val_
     else:
         action = Variable(
-            torch.Tensor([np.random.choice(range(args.rl_pool), state.size()[0], replace=True)])
+            torch.Tensor(
+                [np.random.choice(range(args.rl_pool), action_state.size()[0], replace=True)]
+            )
             .type(torch.LongTensor)
             .view(-1)
         )  # .cuda()
 
     return action
-
-
-# TODO rewrite to remove all the fancy image/region candidate stuff. Make it simply add a datapoint to the labelleddataset
-def add_labeled_datapoint(
-    args, list_existing_images, region_candidates, train_set, action_list, budget, n_ep
-):
-    """This function adds an image, indicated by 'action_list' out of 'region_candidates' list
-     and adds it into the labeled dataset and the list of existing images.
-
-    :(argparse.ArgumentParser) args: The parser with all the defined arguments.
-    :param list_existing_images: (list) of tuples (image idx, region_x, region_y) of all regions that have
-            been selected in the past to add them to the labeled set.
-    :param region_candidates: (list) List of all possible regions to add.
-    :param train_set: (torch.utils.data.Dataset) Training set.
-    :param action_list: Selected indexes of the regions in 'region_candidates' to be labeled.
-    :param budget: (int) Number of maximum regions we want to label.
-    :param n_ep: (int) Number of episode.
-    :return: List of existing images, updated with the new image.
-    """
-
-    lab_set = open(
-        os.path.join(args.ckpt_path, args.exp_name, "labeled_set_" + str(n_ep) + ".txt"), "a"
-    )
-    for i, action in enumerate(action_list):
-        if train_set.get_num_labeled_regions() >= budget:
-            print("Budget reached with " + str(train_set.get_num_labeled_regions()) + " regions!")
-            break
-        im_toadd = region_candidates[i, action, 0]
-        train_set.add_index(
-            im_toadd, (region_candidates[i, action, 1], region_candidates[i, action, 2])
-        )
-        list_existing_images.append(tuple(region_candidates[i, action]))
-        lab_set.write(
-            "%i,%i,%i"
-            % (im_toadd, region_candidates[i, action, 1], region_candidates[i, action, 2])
-        )
-        lab_set.write("\n")
-    print("Labeled set has now " + str(train_set.get_num_labeled_regions()) + " labeled regions.")
-
-    return list_existing_images
 
 
 def apply_dropout(m):
@@ -500,69 +447,35 @@ def optimize_q_network(
     for ep in range(dqn_epochs):
         optimizerP.zero_grad()
         transitions = memory.sample(BATCH_SIZE)
-        # Transpose the batch (see http://stackoverflow.com/a/19343/3343043 for
-        # detailed explanation).
-        batch = Transition(*zip(*transitions))
-        # Compute a mask of non-final states and concatenate the batch elements
-        non_final_mask = torch.tensor(
-            tuple(map(lambda s: s is not None, batch.next_state)), dtype=torch.uint8
-        ).cuda()
+        expected_q_values = []
+        for transition in transitions:
+            # Predict q-value function value for all available actions in transition
+            # action_i = select_action(
+            #    args, policy_net, transition.model_state, transition.action_state, test=False
+            # )
+            with torch.autograd.set_detect_anomaly(True):
+                action_i = 2
+                policy_net.train()
+                q_policy = policy_net(
+                    transition.model_state.detach(), transition.action_state[action_i].detach()
+                )
+                q_target = target_net(
+                    transition.model_state.detach(), transition.action_state[action_i].detach()
+                )
 
-        non_final_next_states = torch.cat([s for s in batch.next_state if s is not None])
-        non_final_next_states_subset = torch.cat(
-            [s for s in batch.next_state_subset if s is not None]
-        )
+                # Compute the expected Q values
+                expected_q_values = (q_target * GAMMA) + transition.reward
 
-        state_batch = torch.cat(batch.state)
-        state_batch_subset = torch.cat(batch.state_subset)
-        action_batch = torch.Tensor([batch.action]).view(-1).type(torch.LongTensor)
-        reward_batch = torch.Tensor([batch.reward]).view(-1).cuda()
-        # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
-        # columns of actions taken
-        q_val = policy_net(state_batch.cuda(), state_batch_subset.cuda())
-        state_batch.cpu()
-        state_batch_subset.cpu()
-        state_action_values = q_val.gather(1, action_batch.unsqueeze(1).cuda())
-        action_batch.cpu()
-        # Compute V(s_{t+1}) for all next states.
-        next_state_values = torch.zeros(BATCH_SIZE).cuda()
-        # Double dqn, so we compute the values with the target network, we choose the actions with the policy network
-        if non_final_mask.sum().item() > 0:
-            v_val_act = policy_net(
-                non_final_next_states.cuda(), non_final_next_states_subset.cuda()
-            ).detach()
-            v_val = target_net(
-                non_final_next_states.cuda(), non_final_next_states_subset.cuda()
-            ).detach()
-            non_final_next_states.cpu()
-            non_final_next_states_subset.cpu()
-            act = v_val_act.max(1)[1]
-            next_state_values[non_final_mask] = v_val.gather(1, act.unsqueeze(1)).view(-1)
-        # Compute the expected Q values
-        expected_state_action_values = (next_state_values * GAMMA) + reward_batch
-        # Compute Huber loss
-        loss = F.smooth_l1_loss(state_action_values.view(-1), expected_state_action_values)
-        loss_item += loss.item()
-        progress_bar(ep, dqn_epochs, "[DQN loss %.5f]" % (loss_item / (ep + 1)))
-        loss.backward()
+                # Compute Huber loss
+                loss = F.mse_loss(q_policy, expected_q_values)
+                # loss_item += loss.item()
+                # progress_bar(ep, dqn_epochs, "[DQN loss %.5f]" % (loss_item / (ep + 1)))
+                loss.backward()
         optimizerP.step()
 
-        del q_val
-        del expected_state_action_values
         del loss
-        del next_state_values
-        del reward_batch
-        if non_final_mask.sum().item() > 0:
-            del act
-            del v_val
-            del v_val_act
-        del state_action_values
-        del state_batch
-        del action_batch
-        del non_final_mask
-        del non_final_next_states
-        del batch
         del transitions
+
     lab_set = open(os.path.join(args.ckpt_path, args.exp_name, "q_loss.txt"), "a")
     lab_set.write("%f" % (loss_item))
     lab_set.write("\n")

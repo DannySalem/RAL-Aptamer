@@ -1,3 +1,4 @@
+from data import dataset
 import os
 import sys
 import shutil
@@ -7,6 +8,7 @@ from collections import namedtuple
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 from torch.autograd import Variable
 from torch.backends import cudnn
 from torch.optim.lr_scheduler import ExponentialLR
@@ -14,10 +16,8 @@ from torch.optim.lr_scheduler import ExponentialLR
 from models.model_utils import (
     create_models,
     load_models,
-    get_region_candidates,
     compute_state,
     select_action,
-    add_labeled_datapoint,
     optimize_q_network,
 )
 from utils.final_utils import (
@@ -28,8 +28,9 @@ from utils.final_utils import (
     set_training_stage,
 )
 
-from data.data_utils import get_data
+from data.data_utils import get_exp_data, get_iter_data, add_labeled_datapoint
 from utils.replay_buffer import ReplayMemory
+from utils.replay_new import ReplayBuffer
 import utils.parser as parser
 from utils.final_utils import train, validate, final_test
 
@@ -52,7 +53,7 @@ def main(args):
     parser.save_arguments(args)
     ####------ Copy current config file to ckpt folder ------####
     fn = sys.argv[0].rsplit("/", 1)[-1]
-    shutil.copy(sys.argv[0], os.path.join(args.ckpt_path, args.exp_name, fn))
+    # shutil.copy(sys.argv[0], os.path.join(args.ckpt_path, args.exp_name, fn))
 
     ####------ Create segmentation, query and target networks ------####
 
@@ -60,39 +61,48 @@ def main(args):
 
     # TODO remove unnecessary things from load_models
     ####------ Load weights if necessary and create log file ------####
-    kwargs_load = {
-        "net": net,
-        "load_weights": args.load_weights,
-        "exp_name_toload": args.exp_name_toload,
-        "snapshot": args.snapshot,
-        "exp_name": args.exp_name,
-        "ckpt_path": args.ckpt_path,
-        "checkpointer": args.checkpointer,
-        "exp_name_toload_rl": args.exp_name_toload_rl,
-        "policy_net": policy_net,
-        "target_net": target_net,
-        "test": args.test,
-        "dataset": args.dataset,
-        "al_algorithm": args.al_algorithm,
-    }
-    _ = load_models(**kwargs_load)
+    # kwargs_load = {
+    #    "net": net,
+    #    "load_weights": args.load_weights,
+    #    "exp_name_toload": args.exp_name_toload,
+    #    "snapshot": args.snapshot,
+    #    "exp_name": args.exp_name,
+    #    "ckpt_path": args.ckpt_path,
+    #    "checkpointer": args.checkpointer,
+    #    "exp_name_toload_rl": args.exp_name_toload_rl,
+    #    "policy_net": policy_net,
+    #    "target_net": target_net,
+    #    "test": args.test,
+    #    "dataset": args.dataset,
+    #    "al_algorithm": args.al_algorithm,
+    # }
+    # _ = load_models(**kwargs_load)
 
     ####------ Load training and validation data ------####
-    kwargs_data = {
-        "data_path": args.data_path,
-        "tr_bs": args.train_batch_size,
-        "vl_bs": args.val_batch_size,
-        "n_workers": 4,
-        "input_size": args.input_size,
-        "num_each_iter": args.num_each_iter,
-        "dataset": args.dataset,
-        "test": args.test,
-    }
+    # kwargs_data = {
+    #    "data_path": args.data_path,
+    #    "tr_bs": args.train_batch_size,
+    #    "vl_bs": args.val_batch_size,
+    #    "n_workers": 4,
+    #    "input_size": args.input_size,
+    #    "num_each_iter": args.num_each_iter,
+    #    "dataset": args.dataset,
+    #    "test": args.test,
+    # }
 
-    state_dataset, unlabelled_dataset, labelled_dataset = get_data(**kwargs_data)
+    state_dataset, labelled_dataset, val_dataset = get_exp_data()
+    labelledLoader = DataLoader(
+        labelled_dataset, batch_size=12, shuffle=True, num_workers=0, pin_memory=False
+    )
+    valLoader = DataLoader(
+        val_dataset, batch_size=12, shuffle=True, num_workers=0, pin_memory=False
+    )
+    stateLoader = DataLoader(
+        state_dataset, batch_size=15, shuffle=True, num_workers=0, pin_memory=False
+    )
 
     ####------ Create loss ------####
-    criterion = nn.MSELoss(ignore_index=train_loader.dataset.ignore_label).cuda()
+    criterion = nn.MSELoss().cuda()
 
     ####------ Create optimizers (and load them if necessary) ------####
     kwargs_load_opt = {
@@ -136,16 +146,17 @@ def main(args):
         Transition = namedtuple(
             "Transition",
             (
-                "classifier_state",
+                "model_state",
                 "action_state",
-                "next_classifier_state",
+                "next_model_state",
                 "next_action_state",
                 "reward",
                 "terminal",
             ),
         )
 
-        memory = ReplayMemory(buffer_size=args.rl_buffer)
+        memory = ReplayBuffer(buffer_size=args.rl_buffer)
+        memory2 = ReplayMemory(capacity=args.rl_buffer)
         # Load Target Network, set to eval Mode, Set how often to update the weights
         TARGET_UPDATE = 5
         target_net.load_state_dict(policy_net.state_dict())
@@ -169,45 +180,45 @@ def main(args):
             counter_iter = 0
 
             # Sample Unlabelled datapoints
-            # TODO Incorporate Sampler
-            samples = Sampler.get_samples
-            unlabelled_dataset.reset()
-            unlabelled_dataset.add_samples(samples)
-
+            unlabelled_dataset = get_iter_data()
+            unlabelledLoader = DataLoader(
+                unlabelled_dataset, batch_size=15, shuffle=True, num_workers=0, pin_memory=False
+            )
             # Compute state. Shape:[group_size, num regions, dim, w,h]
             model_state, action_state = compute_state(
-                net, state_dataset, unlabelled_dataset, labelled_dataset
+                net, stateLoader, unlabelledLoader, labelled_dataset, unlabelled_dataset
             )
 
             args.epoch_num = epoch_num
             args.patience = patience
+            args.rl_pool = 100
             # Take images while the budget is not met
             while not terminal:
                 # Choose actions. The actions are the regions to label at a given step
-                action = select_action(args, policy_net, model_state, action_state)
+                action = select_action(args, policy_net, model_state, action_state, steps_done)
                 steps_done += 1
 
                 # TODO Update to match our data
-                list_existing_images = add_labeled_datapoint(
-                    args,
-                    list_existing_images=list_existing_images,
-                    region_candidates=region_candidates,
-                    train_set=train_set,
-                    action_list=action,
-                    budget=args.budget_labels,
-                    n_ep=n_ep,
-                )
-
+                # list_existing_images = add_labeled_datapoint(
+                #    args,
+                #    list_existing_images=list_existing_images,
+                #    region_candidates=region_candidates,
+                #    train_set=train_set,
+                #    action_list=action,
+                #    budget=args.budget_labels,
+                #    n_ep=n_ep,
+                # )
+                add_labeled_datapoint(labelled_dataset, unlabelled_dataset[action])
                 # Train segmentation network with selected regions:
                 print("Train network with selected images...")
-                tr_iu, vl_iu, vl_iu_xclass = train_classif(
+                train_loss, val_loss, val_rmse = train_seq_model(
                     args,
                     0,
-                    train_loader,
+                    labelledLoader,
                     net,
                     criterion,
                     optimizer,
-                    val_loader,
+                    valLoader,
                     best_record,
                     logger,
                     scheduler,
@@ -216,15 +227,16 @@ def main(args):
 
                 reward = -1
 
-                # Get candidates for next state
-                samples = Sampler.get_samples
-                unlabelled_dataset.reset()
-                unlabelled_dataset.add_samples(samples)
+                # Sample Unlabelled datapoint candidates for next state
+                unlabelled_dataset = get_iter_data()
+                unlabelledLoader = DataLoader(
+                    unlabelled_dataset, batch_size=15, shuffle=True, num_workers=0, pin_memory=False
+                )
 
                 # Compute next state
                 if not terminal:
                     next_model_state, next_action_state = compute_state(
-                        net, state_dataset, unlabelled_dataset, labelled_dataset
+                        net, stateLoader, unlabelledLoader, labelled_dataset, unlabelled_dataset
                     )
                 else:
                     next_model_state = None
@@ -232,12 +244,15 @@ def main(args):
 
                 # Store the transition in experience replay. Next state is None if the budget has been reached (final
                 # state)
-                if terminal:
-                    memory.push(current_state, action, None, reward)
-                    del reward
-                    budget_reached = True
-                else:
-                    memory.push(current_state, action, next_state, reward)
+
+                memory2.push(
+                    model_state,
+                    action_state,
+                    next_model_state,
+                    next_action_state,
+                    reward,
+                    terminal,
+                )
 
                 # Move to the next state
                 del model_state, action_state
@@ -248,13 +263,13 @@ def main(args):
                 # Perform optimization on the target network
                 optimize_q_network(
                     args,
-                    memory,
+                    memory2,
                     Transition,
                     policy_net,
                     target_net,
                     optimizerP,
                     GAMMA=args.dqn_gamma,
-                    BATCH_SIZE=args.dqn_bs,
+                    BATCH_SIZE=4,  # args.dqn_bs,
                 )
 
                 # Save weights of policy_net and target_net
@@ -284,7 +299,7 @@ def main(args):
             print("Training with all images, training with patience 0")
             args.patience = 0
             # Train until convergence
-            _, val_acc_episode, _ = train_classif(
+            _, val_acc_episode, _ = train_seq_model(
                 args,
                 curr_epoch,
                 train_loader,
@@ -391,7 +406,7 @@ def main(args):
                 )
                 policy_net.cuda()
         ## [ --- End of episode iteration --- ] ##
-
+    # TODO I haven't looked at TEST yet. Should be pretty similar to Train though.
     #####################################################################
     ################################ TEST ########################
     #####################################################################
@@ -489,10 +504,10 @@ def main(args):
                 )
                 set_training_stage(args, "added")
 
-            # Train network for classification with selected images:
+            # Train network for regression with selected images:
             print("Train network with selected images...")
             if get_training_stage(args) == "added":
-                tr_iu, vl_iu, _ = train_classif(
+                tr_iu, vl_iu, _ = train_seq_model(
                     args,
                     0,
                     train_loader,
@@ -536,14 +551,14 @@ def main(args):
                     next_state = None
                     budget_reached = True
 
-        if budget_reached:
+        if terminal:
             if args.only_last_labeled:
                 train_set.end_al = True
             print("Training with all regions.")
             args.epoch_num = 1000
 
             # Train until convergence
-            _, val_acc_episode, _ = train_classif(
+            _, val_acc_episode, _ = train_seq_model(
                 args,
                 curr_epoch,
                 train_loader,
@@ -566,7 +581,8 @@ def main(args):
             final_test(args, net, criterion)
 
 
-def train_classif(
+# TODO Update sequence model training
+def train_seq_model(
     args,
     curr_epoch,
     train_loader,
@@ -580,65 +596,33 @@ def train_classif(
     schedulerP,
     final_train=False,
 ):
-    tr_iu = 0
-    val_iu = 0
-    iu_xclass = [0.0] * 19 if "cityscapes" in args.dataset else 11
-    # Early stopping params initialization
-    es_val = best_record["mean_iu"]
-    if get_training_stage(args) is not None:
-        es_counter = (
-            int(get_training_stage(args).split("-")[1])
-            if "final_train" in get_training_stage(args)
-            else 0
-        )
-    else:
-        es_counter = 0
 
     for epoch in range(curr_epoch, args.epoch_num):
         print("Epoch %i /%i" % (epoch, args.epoch_num + 1))
-        tr_loss, tr_loss_d, tr_acc, tr_iu = train(train_loader, net, criterion, optimizer)
+        train_loss = train(train_loader, net, criterion, optimizer)
+
+        val_loss, rmse, best_record = validate(
+            val_loader, net, criterion, optimizer, epoch, best_record, args
+        )
+
         if final_train:
-            vl_loss, val_acc, val_iu, iu_xclass, best_record = validate(
-                val_loader, net, criterion, optimizer, epoch, best_record, args
-            )
-        else:
-            if epoch == args.epoch_num - 1:
-                vl_loss, val_acc, val_iu, iu_xclass, best_record = validate(
-                    val_loader, net, criterion, optimizer, args.epoch_num, best_record, args
-                )
-        if final_train or (not final_train and epoch == args.epoch_num - 1):
             scheduler.step()
             scheduler.step()
-            if args.al_algorithm == "ralis" and schedulerP is not None:
+            if schedulerP is not None:
                 schedulerP.step()
-            # Early stopping with val jaccard
-            es_counter += 1
-            if val_iu > es_val:
-                es_val = val_iu
-                es_counter = 0
-            elif es_counter > args.patience:
-                print("Patience for Early Stopping reached!")
-                break
+
             ## Append info to logger
 
             info = [
                 epoch,
                 optimizer.param_groups[0]["lr"],
-                tr_loss,
-                tr_loss_d,
-                vl_loss,
-                tr_acc,
-                val_acc,
-                tr_iu,
-                val_iu,
+                train_loss,
+                val_loss,
             ]
-            for cl in range(train_loader.dataset.num_classes):
-                info.append(iu_xclass[cl])
+
             logger.append(info)
 
-            if final_train:
-                set_training_stage(args, "final_train-" + str(es_counter))
-    return tr_iu, val_iu, iu_xclass
+    return train_loss, val_loss, rmse
 
 
 if __name__ == "__main__":

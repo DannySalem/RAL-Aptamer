@@ -3,9 +3,17 @@ name: ral-aptamer
 channels:
   - conda-forge
   - pytorch
+  - bioconda
 
 dependencies:
   - python>=3.6
-  - numpy>=1.18.1
-  - pytorch>=1.4.0
-  - scipy>=1.4.1
+  - numpy
+  - pytorch>=1.9.0
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - tqdm
+#  - rnasketch
+#  - pip>=20.0.2
+#  - pip:
+#      - seqfold

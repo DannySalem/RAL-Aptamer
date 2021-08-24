@@ -2,7 +2,7 @@ import os
 import gc
 import numpy as np
 import pickle
-
+import math
 import torch
 import torchvision.transforms as standard_transforms
 from torch import optim
@@ -70,16 +70,12 @@ def get_logfile(ckpt_path, exp_name, checkpointer, snapshot, log_name="log.txt")
         "Epoch",
         "Learning Rate",
         "Train Loss",
-        "(deprecated)",
         "Valid Loss",
         "Train Acc.",
         "Valid Acc.",
-        "Train mean iu",
-        "Valid mean iu",
     ]
-    for cl in range(num_classes):
-        log_columns.append("iu_cl" + str(cl))
-    best_record = {"epoch": 0, "val_loss": 1e10, "acc": 0, "mean_iu": 0}
+
+    best_record = {"epoch": 0, "val_loss": 1e10, "rmse": 1000000}
     curr_epoch = 0
     ##-- Check if log file exists --##
     if checkpointer:
@@ -129,136 +125,91 @@ def set_training_stage(args, stage):
 def train(train_loader, net, criterion, optimizer, supervised=False):
     net.train()
     train_loss = 0
-    cm_py = (
-        torch.zeros((train_loader.dataset.num_classes, train_loader.dataset.num_classes))
-        .type(torch.IntTensor)
-        .cuda()
-    )
+
     for i, data in enumerate(train_loader):
         optimizer.zero_grad()
-        if supervised:
-            im_s, t_s_, _ = data
-        else:
-            im_s, t_s_, _, _, _ = data
 
-        t_s, im_s = Variable(t_s_).cuda(), Variable(im_s).cuda()
+        sequences, labels = data
+
         # Get output of network
-        outputs, _ = net(im_s)
-        # Get segmentation maps
-        predictions_py = outputs.data.max(1)[1].squeeze_(1)
-        loss = criterion(outputs, t_s)
+        outputs = net(sequences)
+
+        loss = criterion(outputs, labels)
         train_loss += loss.item()
 
         loss.backward()
-        nn.utils.clip_grad_norm_(net.parameters(), max_norm=4)
+        nn.utils.clip_grad_norm_(
+            net.parameters(), max_norm=4
+        )  # TODO Confirm that this gradient clipping is necessary
         optimizer.step()
-
-        cm_py = confusion_matrix_pytorch(
-            cm_py, predictions_py.view(-1), t_s_.cuda().view(-1), train_loader.dataset.num_classes
-        )
 
         progress_bar(i, len(train_loader), "[train loss %.5f]" % (train_loss / (i + 1)))
 
+        # Manual Garbage collection. Not sure how important this is...
         del outputs
         del loss
         gc.collect()
     print(" ")
-    acc, mean_iu, iu = evaluate(cm_py.cpu().numpy())
-    print(" [train acc %.5f], [train iu %.5f]" % (acc, mean_iu))
-    return train_loss / (len(train_loader)), 0, acc, mean_iu
+    return np.mean(train_loss)
 
 
-def validate(
-    val_loader, net, criterion, optimizer, epoch, best_record, args, final_final_test=False
-):
+def validate(val_loader, net, criterion, optimizer, epoch, best_record, args):
     net.eval()
-
     val_loss = 0
-    cm_py = (
-        torch.zeros((val_loader.dataset.num_classes, val_loader.dataset.num_classes))
-        .type(torch.IntTensor)
-        .cuda()
-    )
-    for vi, data in enumerate(val_loader):
-        inputs, gts_, _ = data
-        with torch.no_grad():
-            inputs = Variable(inputs).cuda()
-            gts = Variable(gts_).cuda()
-        outputs, _ = net(inputs)
-        # Make sure both output and target have the same dimensions
-        if outputs.shape[2:] != gts.shape[1:]:
-            outputs = outputs[
-                :,
-                :,
-                0 : min(outputs.shape[2], gts.shape[1]),
-                0 : min(outputs.shape[3], gts.shape[2]),
-            ]
-            gts = gts[
-                :, 0 : min(outputs.shape[2], gts.shape[1]), 0 : min(outputs.shape[3], gts.shape[2])
-            ]
-        predictions_py = outputs.data.max(1)[1].squeeze_(1)
-        loss = criterion(outputs, gts)
+    vi = 0
+    for i, data in enumerate(val_loader):
+        sequences, labels = data
+
+        outputs = net(sequences)
+
+        loss = criterion(outputs, labels)
         vl_loss = loss.item()
         val_loss += vl_loss
 
-        cm_py = confusion_matrix_pytorch(
-            cm_py, predictions_py.view(-1), gts_.cuda().view(-1), val_loader.dataset.num_classes
-        )
-
         len_val = len(val_loader)
-        progress_bar(vi, len_val, "[val loss %.5f]" % (val_loss / (vi + 1)))
+        vi += len((labels))
+        progress_bar(i, len_val, "[val loss %.5f]" % (val_loss / vi))
 
         del outputs
         del vl_loss
         del loss
-        del predictions_py
-    acc, mean_iu, iu = evaluate(cm_py.cpu().numpy())
+    rmse = math.sqrt(val_loss / vi)
     print(" ")
-    print(" [val acc %.5f], [val iu %.5f]" % (acc, mean_iu))
+    print(" [val rmse %.5f]" % (rmse))
 
-    if not final_final_test:
-        if mean_iu > best_record["mean_iu"]:
-            best_record["val_loss"] = val_loss / len(val_loader)
-            best_record["epoch"] = epoch
-            best_record["acc"] = acc
-            best_record["iu"] = iu
-            best_record["mean_iu"] = mean_iu
+    if rmse < best_record["rmse"]:
+        best_record["val_loss"] = val_loss / vi
+        best_record["epoch"] = epoch
+        best_record["rmse"] = rmse
 
-            torch.save(
-                net.cpu().state_dict(),
-                os.path.join(args.ckpt_path, args.exp_name, "best_jaccard_val.pth"),
-            )
-            net.cuda()
-            torch.save(
-                optimizer.state_dict(),
-                os.path.join(args.ckpt_path, args.exp_name, "opt_best_jaccard_val.pth"),
-            )
-
-        ## Save checkpoint every epoch
         torch.save(
             net.cpu().state_dict(),
-            os.path.join(args.ckpt_path, args.exp_name, "last_jaccard_val.pth"),
+            os.path.join(args.ckpt_path, args.exp_name, "best_jaccard_val.pth"),
         )
         net.cuda()
         torch.save(
             optimizer.state_dict(),
-            os.path.join(args.ckpt_path, args.exp_name, "opt_last_jaccard_val.pth"),
+            os.path.join(args.ckpt_path, args.exp_name, "opt_best_jaccard_val.pth"),
         )
 
-        print(
-            "best record: [val loss %.5f], [acc %.5f], [mean_iu %.5f],"
-            " [epoch %d]"
-            % (
-                best_record["val_loss"],
-                best_record["acc"],
-                best_record["mean_iu"],
-                best_record["epoch"],
-            )
-        )
+    ## Save checkpoint every epoch
+    torch.save(
+        net.cpu().state_dict(), os.path.join(args.ckpt_path, args.exp_name, "last_jaccard_val.pth"),
+    )
+    net.cuda()
+    torch.save(
+        optimizer.state_dict(),
+        os.path.join(args.ckpt_path, args.exp_name, "opt_last_jaccard_val.pth"),
+    )
+
+    print(
+        "best record: [val loss %.5f], [rmse %.5f], [epoch %.5f]"
+        % (best_record["val_loss"], best_record["rmse"], best_record["epoch"],)
+    )
 
     print("----------------------------------------")
 
-    return val_loss / len(val_loader), acc, mean_iu, iu, best_record
+    return val_loss / vi, rmse, best_record
 
 
 def test(val_loader, net, criterion):

@@ -49,7 +49,8 @@ def get_arguments():
     parser.add_argument(
         "--load-opt", action="store_true", help="Load optimizer weights from another file."
     )
-
+    parser.add_argument("--train", action="store_true", help="Train the model.")
+    parser.add_argument("--test", action="store_true", help="Test the model.")
     # Proxy Model Training Arguments
     parser.add_argument("--epoch-num", type=int, default=1, help="Number of epochs to train for.")
     parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate")
