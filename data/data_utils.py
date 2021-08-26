@@ -31,7 +31,7 @@ params[
 toy_oracle = oracle(params)
 toy_oracle.initializeDataset()
 
-# TODO write method to make all necessary datasets
+
 def get_exp_data():
     """Create all datasets required for Training.
 

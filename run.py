@@ -1,7 +1,5 @@
-from data import dataset
 import os
 import sys
-import shutil
 import random
 import numpy as np
 from collections import namedtuple
@@ -9,7 +7,6 @@ from collections import namedtuple
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.autograd import Variable
 from torch.backends import cudnn
 from torch.optim.lr_scheduler import ExponentialLR
 
@@ -30,7 +27,6 @@ from utils.final_utils import (
 
 from data.data_utils import get_exp_data, get_iter_data, add_labeled_datapoint
 from utils.replay_buffer import ReplayMemory
-from utils.replay_new import ReplayBuffer
 import utils.parser as parser
 from utils.final_utils import train, validate, final_test
 
@@ -55,9 +51,11 @@ def main(args):
     fn = sys.argv[0].rsplit("/", 1)[-1]
     # shutil.copy(sys.argv[0], os.path.join(args.ckpt_path, args.exp_name, fn))
 
-    ####------ Create segmentation, query and target networks ------####
+    ####------ Create proxy, query and target networks ------####
 
     net, policy_net, target_net = create_models()
+    net = AptamerLSTM().cuda()
+    print("Model has " + str(count_parameters(net)))
 
     # TODO remove unnecessary things from load_models
     ####------ Load weights if necessary and create log file ------####
@@ -77,18 +75,6 @@ def main(args):
     #    "al_algorithm": args.al_algorithm,
     # }
     # _ = load_models(**kwargs_load)
-
-    ####------ Load training and validation data ------####
-    # kwargs_data = {
-    #    "data_path": args.data_path,
-    #    "tr_bs": args.train_batch_size,
-    #    "vl_bs": args.val_batch_size,
-    #    "n_workers": 4,
-    #    "input_size": args.input_size,
-    #    "num_each_iter": args.num_each_iter,
-    #    "dataset": args.dataset,
-    #    "test": args.test,
-    # }
 
     state_dataset, labelled_dataset, val_dataset = get_exp_data()
     labelledLoader = DataLoader(
@@ -155,8 +141,7 @@ def main(args):
             ),
         )
 
-        memory = ReplayBuffer(buffer_size=args.rl_buffer)
-        memory2 = ReplayMemory(capacity=args.rl_buffer)
+        memory = ReplayMemory(capacity=args.rl_buffer)
         # Load Target Network, set to eval Mode, Set how often to update the weights
         TARGET_UPDATE = 5
         target_net.load_state_dict(policy_net.state_dict())
@@ -245,7 +230,7 @@ def main(args):
                 # Store the transition in experience replay. Next state is None if the budget has been reached (final
                 # state)
 
-                memory2.push(
+                memory.push(
                     model_state,
                     action_state,
                     next_model_state,
@@ -263,7 +248,7 @@ def main(args):
                 # Perform optimization on the target network
                 optimize_q_network(
                     args,
-                    memory2,
+                    memory,
                     Transition,
                     policy_net,
                     target_net,
@@ -327,7 +312,7 @@ def main(args):
 
             print("Resetting the networks, optimizers and data!")
             # Create the networks from scratch, except the policy and target networks.
-            ####------ Create segmentation, query and target network ------####
+            ####------ Create proxy, query and target network ------####
             kwargs_models = {
                 "dataset": args.dataset,
                 "al_algorithm": args.al_algorithm,
@@ -581,7 +566,6 @@ def main(args):
             final_test(args, net, criterion)
 
 
-# TODO Update sequence model training
 def train_seq_model(
     args,
     curr_epoch,

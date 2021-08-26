@@ -265,7 +265,6 @@ def select_action(args, policy_net, model_state, action_state, steps_done, test=
     sample = random.random()
     eps_threshold = EPS_END + (EPS_START - EPS_END) * math.exp(-1.0 * steps_done / EPS_DECAY)
     q_val_ = []
-    sample = 1  # TODO Remove
     if sample > eps_threshold or test:
         print("Action selected with DQN!")
         with torch.no_grad():
@@ -284,136 +283,6 @@ def select_action(args, policy_net, model_state, action_state, steps_done, test=
         )  # .cuda()
 
     return action
-
-
-def apply_dropout(m):
-    if type(m) == nn.Dropout:
-        m.train()
-
-
-def compute_bald(predictions):
-    ### Compute BALD ###
-    expected_entropy = -torch.mean(
-        torch.sum(predictions * torch.log(predictions + 1e-10), dim=1), dim=0
-    )
-    expected_p = torch.mean(predictions, dim=0)  # [batch_size, n_classes]
-    pred_py = expected_p.max(0)[1]
-    entropy_expected_p = -torch.sum(
-        expected_p * torch.log(expected_p + 1e-10), dim=0
-    )  # [batch size]
-    bald_acq = entropy_expected_p - expected_entropy
-    return bald_acq.unsqueeze(0), pred_py.unsqueeze(0)
-
-
-def add_kl_pool2(state, n_cl=19):
-    sim_matrix = torch.zeros((state.shape[0], state.shape[1], 32))
-    all_cand = state[:, :, 0 : n_cl + 1].view(-1, n_cl + 1).transpose(1, 0)
-    for i in range(state.shape[0]):
-        pool_hist = state[i, :, 0 : n_cl + 1]
-        for j in range(pool_hist.shape[0]):
-            prov_sim = entropy(
-                pool_hist[j : j + 1].repeat(all_cand.shape[1], 1).transpose(0, 1), all_cand
-            )
-            hist, _ = np.histogram(prov_sim, bins=32)
-            hist = hist / hist.sum()
-            sim_matrix[i, j, :] = torch.Tensor(hist)
-    state = torch.cat([state, sim_matrix], dim=2)
-    return state
-
-
-def create_feature_vector_3H_region_kl_sim(
-    pred_region, ent_region, train_set, num_classes=19, reg_sz=(128, 128)
-):
-    unique, counts = np.unique(pred_region, return_counts=True)
-    sample_stats = np.zeros(num_classes + 1) + 1e-7
-    sample_stats[unique.astype(int)] = counts
-    sample_stats = sample_stats.tolist()
-    sz = ent_region.size()
-    ks_x = int(reg_sz[0] // 8)
-    ks_y = int(reg_sz[1] // 8)
-    with torch.no_grad():
-        sample_stats += (
-            5
-            - F.max_pool2d(5 - ent_region.view(1, 1, sz[0], sz[1]), kernel_size=(ks_y, ks_x)).view(
-                -1
-            )
-        ).tolist()  # min entropy
-        sample_stats += (
-            F.avg_pool2d(ent_region.view(1, 1, sz[0], sz[1]), kernel_size=(ks_y, ks_x))
-            .view(-1)
-            .tolist()
-        )
-        sample_stats += (
-            F.max_pool2d(ent_region.view(1, 1, sz[0], sz[1]), kernel_size=(ks_y, ks_x))
-            .view(-1)
-            .tolist()
-        )
-    if len(train_set.balance_cl) > 0:
-        inp_hist = sample_stats[0 : num_classes + 1]
-        sim_sample = entropy(
-            np.repeat(np.asarray(inp_hist)[:, np.newaxis], len(train_set.balance_cl), axis=1),
-            np.asarray(train_set.balance_cl).transpose(1, 0),
-        )
-        hist, _ = np.histogram(sim_sample, bins=32)
-        sim_lab = list(hist / hist.sum())
-        sample_stats += sim_lab
-    else:
-        sample_stats += [0.0] * 32
-    return sample_stats
-
-
-def create_feature_vector_3H_region_kl(pred_region, ent_region, num_classes=19, reg_sz=(128, 128)):
-    unique, counts = np.unique(pred_region, return_counts=True)
-    sample_stats = np.zeros(num_classes + 1) + 1e-7
-    sample_stats[unique.astype(int)] = counts
-    sample_stats = sample_stats.tolist()
-    sz = ent_region.size()
-    ks_x = int(reg_sz[0] // 8)
-    ks_y = int(reg_sz[1] // 8)
-    with torch.no_grad():
-        sample_stats += (
-            5
-            - F.max_pool2d(5 - ent_region.view(1, 1, sz[0], sz[1]), kernel_size=(ks_y, ks_x)).view(
-                -1
-            )
-        ).tolist()  # min entropy
-        sample_stats += (
-            F.avg_pool2d(ent_region.view(1, 1, sz[0], sz[1]), kernel_size=(ks_y, ks_x))
-            .view(-1)
-            .tolist()
-        )
-        sample_stats += (
-            F.max_pool2d(ent_region.view(1, 1, sz[0], sz[1]), kernel_size=(ks_y, ks_x))
-            .view(-1)
-            .tolist()
-        )
-    return sample_stats
-
-
-def compute_entropy_seg(args, im_t, net):
-    """
-    Compute entropy function
-    :param args:
-    :param im_t:
-    :param net:
-    :return:
-    """
-    net.eval()
-    if im_t.dim() == 3:
-        im_t_sz = im_t.size()
-        im_t = im_t.view(1, im_t_sz[0], im_t_sz[1], im_t_sz[2])
-
-    out, _ = net(im_t)
-    out_soft_log = F.log_softmax(out)
-    out_soft = torch.exp(out_soft_log)
-    ent = -torch.sum(out_soft * out_soft_log, dim=1).detach().cpu()  # .data.numpy()
-    del out
-    del out_soft_log
-    del out_soft
-    del im_t
-
-    return ent
-
 
 def optimize_q_network(
     args,
@@ -450,11 +319,10 @@ def optimize_q_network(
         expected_q_values = []
         for transition in transitions:
             # Predict q-value function value for all available actions in transition
-            # action_i = select_action(
-            #    args, policy_net, transition.model_state, transition.action_state, test=False
-            # )
+            action_i = select_action(
+                args, policy_net, transition.model_state, transition.action_state, test=False
+            )
             with torch.autograd.set_detect_anomaly(True):
-                action_i = 2
                 policy_net.train()
                 q_policy = policy_net(
                     transition.model_state.detach(), transition.action_state[action_i].detach()
@@ -466,7 +334,7 @@ def optimize_q_network(
                 # Compute the expected Q values
                 expected_q_values = (q_target * GAMMA) + transition.reward
 
-                # Compute Huber loss
+                # Compute MSE loss
                 loss = F.mse_loss(q_policy, expected_q_values)
                 # loss_item += loss.item()
                 # progress_bar(ep, dqn_epochs, "[DQN loss %.5f]" % (loss_item / (ep + 1)))

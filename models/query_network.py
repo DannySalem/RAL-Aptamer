@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# TODO Replace with Desired Network Architecture. Currently
+
 class QueryNetworkDQN(nn.Module):
     def __init__(
         self, model_state_length, action_state_length, bias_average,
